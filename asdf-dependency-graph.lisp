@@ -5,7 +5,7 @@
 
 (in-package #:asdf-dependency-graph)
 
-(defstruct node parent child (condition ""))
+(defstruct node parent child type (condition ""))
 
 (defun name-from-system-description (system-description)
   (flet ((feature-string (requirement)
@@ -24,24 +24,58 @@
       (_
        (values system-description :asdf nil)))))
 
-(defun node-name-from-name-type (name type)
+(defun node-name-from-name-type (name type primary-only)
   (ecase type
     (:require (format nil "(:require ~A)" (string-downcase (string name))))
-    (:asdf name)))
+    (:asdf (cond (primary-only (asdf:primary-system-name name))
+                 ((typep name 'asdf:component) (asdf:component-name name))
+                 (t name)))))
 
-(defun dependency-node-list (asdf-system)
+(defun same-primary-system-p (parent child)
+  (equal (asdf:primary-system-name parent) (asdf:primary-system-name child)))
+
+(defun next-depth (current-depth parent child)
+  (when current-depth
+    (- current-depth
+       ;; Avoid incrementing the current depth for, say, PACKAGE-INFERRED-SYSTEMS from a single
+       ;; system definition
+       (if (same-primary-system-p parent child)
+           0
+           1))))
+
+(defun resolve-system (name type)
+  (when (eq type :asdf)
+    (asdf:find-system name)))
+
+(defun node-system-dependencies (node)
+  (case (node-type node)
+    (:asdf
+     (asdf:system-depends-on (asdf:find-system (node-parent node))))))
+
+(defun dependency-node-list (asdf-system &optional extant-depth primary-only)
   (declare (type asdf:system asdf-system))
-  (let ((child-name (asdf:primary-system-name asdf-system))
-        (dependencies (asdf:system-depends-on asdf-system)))
-    (loop :for system-description :in dependencies
-          :nconcing (multiple-value-bind (system-name type requirement)
-                        (name-from-system-description system-description)
-                      (cons (make-node :parent (node-name-from-name-type system-name type)
-                                       :child child-name
-                                       :condition (or requirement ""))
-                            (ecase type
-                              (:require nil)
-                              (:asdf (dependency-node-list (asdf:find-system system-name)))))))))
+  (when (or (null extant-depth) (> extant-depth 0))
+    (let ((child-name (asdf:primary-system-name asdf-system))
+          (dependencies (asdf:system-depends-on asdf-system)))
+      (loop :for system-description :in dependencies
+            :nconcing (multiple-value-bind (system-name type requirement)
+                          (name-from-system-description system-description)
+                        (let* ((system (resolve-system system-name type))
+                               (parent-name (node-name-from-name-type
+                                             (or system system-name) type primary-only))
+                               (tail (ecase type
+                                       (:require nil)
+                                       (:asdf (dependency-node-list
+                                               system
+                                               (next-depth extant-depth asdf-system system)
+                                               primary-only)))))
+                          (if (or (null system) (same-primary-system-p asdf-system system))
+                              tail ; avoid nodes pointing to themselves
+                              (cons (make-node :parent parent-name
+                                               :child child-name
+                                               :type type
+                                               :condition (or requirement ""))
+                                    tail))))))))
 
 (defvar *interesting-systems*)
 (setf (documentation '*interesting-systems* 'variable)
@@ -49,7 +83,7 @@
 mentioned in *INTERESTING-SYSTEMS*")
 (declaim (type list *interesting-systems*))
 
-(defun may-be-filter-for-interesting-systems (node-list)
+(defun may-be-filter-for-interesting-systems (node-list primary-only)
   (if (not (boundp '*interesting-systems*))
       node-list
       (flet ((all-nodes-are-interesting-p (node-list)
@@ -85,21 +119,19 @@ mentioned in *INTERESTING-SYSTEMS*")
                                        (list node))
                                       ((member (node-child node) *interesting-systems* :test #'string=)
                                        (loop :for system-description
-                                               :in (asdf:system-depends-on
-                                                    (asdf:find-system
-                                                     (node-parent node)))
+                                               :in (node-system-dependencies node)
                                              :collect
                                              (multiple-value-bind (name type requirement)
                                                  (name-from-system-description system-description)
-                                               (make-node :parent (node-name-from-name-type name type)
+                                               (make-node :parent (node-name-from-name-type name type primary-only)
                                                           :child (node-child node)
+                                                          :type type
                                                           :condition (or requirement "")))))))))
           node-list))))
 
-(defun generate (output-file target-system)
+(defun generate (output-file target-system &key maximum-depth primary-only)
   (let* ((target-system (etypecase target-system
-                          (string (asdf:find-system target-system))
-                          (symbol (asdf:find-system target-system))
+                          ((or string symbol) (asdf:find-system target-system))
                           (asdf:system target-system)))
          (img-format (let ((suffix-start (position #\. output-file :from-end t)))
                        (if suffix-start
@@ -107,7 +139,8 @@ mentioned in *INTERESTING-SYSTEMS*")
                            "png")))
          (node-list (may-be-filter-for-interesting-systems
                      (dependency-node-list
-                      target-system))))
+                      target-system maximum-depth primary-only)
+                     primary-only)))
     (uiop:with-temporary-file (:type "gv" :pathname path)
       (with-open-file (f path :direction :output
                               :if-exists :supersede)
